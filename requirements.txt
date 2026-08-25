@@ -1,0 +1,26 @@
+# Kaggle already ships torch, numpy and transformers. There you only need:
+#   pip install -q datasets
+#
+# There is no tiktoken any more: the corpus is built with the base model's own
+# tokenizer, so the vocabulary the shards use and the vocabulary the model has
+# are the same object by construction.
+torch>=2.2
+numpy>=1.24
+transformers>=4.40
+safetensors>=0.4
+gradio>=5.0
+matplotlib>=3.7
+
+# pre-tokenization only
+datasets>=2.19
+pyarrow>=15.0
+
+# publish_hf.py --push only
+huggingface_hub>=0.23
+
+# TPU only, and never pip installed on Kaggle: its TPU image ships a matching
+# torch_xla build and installing over it breaks the runtime.
+#   torch_xla
+
+# optional, only for kaggle_driver.py
+kaggle>=1.6
