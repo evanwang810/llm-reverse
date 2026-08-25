@@ -34,6 +34,9 @@ class FinetuneConfig:
     block_size: int
     vocab_size: int
     direction: str = "reverse"
+    # 0 means every parameter was trained. Non-zero means the checkpoint holds
+    # adapters over a frozen base, which changes what publishing has to do.
+    lora_rank: int = 0
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -68,6 +71,13 @@ class FinetuneModel(nn.Module):
 
     # ------------------------------------------------------------------ #
 
+    @property
+    def is_lora(self) -> bool:
+        return self.cfg.lora_rank > 0
+
+    def trainable_params(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
     def non_embedding_params(self) -> int:
         emb = self.hf.get_input_embeddings().weight.numel()
         out = self.hf.get_output_embeddings()
@@ -77,9 +87,23 @@ class FinetuneModel(nn.Module):
 
     def param_report(self) -> str:
         total = sum(p.numel() for p in self.parameters())
+        trainable = self.trainable_params()
         non_emb = self.non_embedding_params()
         hf_cfg = self.hf.config
         tied = getattr(hf_cfg, "tie_word_embeddings", False)
+        if self.is_lora:
+            frozen = total - trainable
+            state = (frozen * bases.BYTES_PER_FROZEN_PARAM
+                     + trainable * bases.BYTES_PER_PARAM) / 1e9
+            how = [f"  LoRA rank {self.cfg.lora_rank}: {trainable:,} trainable "
+                   f"({trainable / total:.1%}), {frozen:,} frozen",
+                   f"  state                : {state:.1f} GB "
+                   f"(frozen at {bases.BYTES_PER_FROZEN_PARAM} bytes, "
+                   f"trainable at {bases.BYTES_PER_PARAM})"]
+        else:
+            how = [f"  full finetune state  : "
+                   f"{total * bases.BYTES_PER_PARAM / 1e9:.1f} GB "
+                   f"({bases.BYTES_PER_PARAM} bytes/param)"]
         return "\n".join([
             f"base: {self.cfg.hf_name}  ({self.cfg.base_key})",
             f"  {getattr(hf_cfg, 'num_hidden_layers', '?')} layers, "
@@ -89,8 +113,7 @@ class FinetuneModel(nn.Module):
             f"  non-embedding params : {non_emb:,} ({non_emb / 1e6:.2f}M)",
             f"  total params         : {total:,} ({total / 1e6:.2f}M)"
             + (" tied embeddings" if tied else ""),
-            f"  full finetune state  : {total * bases.BYTES_PER_PARAM / 1e9:.1f} GB "
-            f"({bases.BYTES_PER_PARAM} bytes/param)",
+            *how,
         ])
 
     def configure_optimizer(self, lr: float, weight_decay: float,
@@ -122,14 +145,48 @@ class FinetuneModel(nn.Module):
 # --------------------------------------------------------------------------- #
 
 
+def apply_lora(hf_model, base):
+    """Wrap the model in LoRA adapters and freeze everything else.
+
+    Targets every linear in the block, not just attention. Reversal changes what
+    the MLP computes as much as what attention attends to, and the conventional
+    attention-only target list leaves two thirds of each layer frozen.
+
+    The base weights are cast to half precision because they are frozen and only
+    ever read; that cast is most of why LoRA reaches a 4B model on a 16 GB chip.
+    The adapters stay fp32, since those are the ones Adam has to keep moments for.
+    """
+    from peft import LoraConfig, get_peft_model
+
+    cfg = LoraConfig(
+        r=base.lora_rank,
+        lora_alpha=base.lora_alpha,
+        lora_dropout=0.0,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=list(base.lora_targets),
+    )
+    model = get_peft_model(hf_model, cfg)
+    half = torch.bfloat16 if base.device == "tpu" else torch.float16
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            param.data = param.data.float()
+        else:
+            param.data = param.data.to(half)
+    return model
+
+
 def build(base_key: str, block_size: int, direction: str = "reverse",
           device: torch.device | str = "cpu", attn: str = "sdpa") -> FinetuneModel:
     """Download the base checkpoint and wrap it.
 
-    Weights land in fp32. That is the master copy: autocast supplies the half
-    precision for the forward pass, and Adam's moments want fp32 anyway. Loading
-    straight into fp16 would save memory now and cost you the optimizer's
-    precision for the whole run.
+    For a full finetune, weights land in fp32: that is the master copy, autocast
+    supplies half precision for the forward pass, and Adam's moments want fp32
+    anyway. Loading straight into fp16 would save memory now and cost the
+    optimizer's precision for the whole run.
+
+    For a LoRA run the frozen base goes to half precision instead, because
+    nothing ever computes a gradient for it.
     """
     from transformers import AutoConfig, AutoModelForCausalLM
 
@@ -144,22 +201,32 @@ def build(base_key: str, block_size: int, direction: str = "reverse",
         # everywhere, but let an unsupported request degrade rather than abort.
         hf_model = AutoModelForCausalLM.from_pretrained(
             base.hf_name, config=hf_cfg, dtype=torch.float32)
-    hf_model.gradient_checkpointing_disable()
+    if base.is_lora:
+        hf_model = apply_lora(hf_model, base)
+    if base.grad_checkpointing:
+        hf_model.gradient_checkpointing_enable()
+        hf_model.enable_input_require_grads()
+    else:
+        hf_model.gradient_checkpointing_disable()
 
     cfg = FinetuneConfig(base_key=base.key, hf_name=base.hf_name,
                          block_size=block_size, vocab_size=base.vocab_size,
-                         direction=direction)
+                         direction=direction, lora_rank=base.lora_rank)
     return FinetuneModel(hf_model, cfg).to(device)
 
 
 def build_smoke(block_size: int = 256, direction: str = "reverse",
-                device: torch.device | str = "cpu") -> FinetuneModel:
+                device: torch.device | str = "cpu",
+                lora_rank: int = 0) -> FinetuneModel:
     """A tiny randomly-initialised model of the same family, built offline.
 
     SmolLM2 is a Llama, so a hand-built LlamaConfig needs no network and no
     cache. The smoke test then walks the identical trainer, resume and sampling
     code path that a real run does, which is the only thing that makes it worth
     running.
+
+    lora_rank turns on the adapter path, so `--smoke-test --base xlarge-lora`
+    exercises LoRA without downloading four billion parameters.
     """
     from transformers import LlamaConfig, LlamaForCausalLM
 
@@ -169,9 +236,19 @@ def build_smoke(block_size: int = 256, direction: str = "reverse",
         max_position_embeddings=block_size, tie_word_embeddings=True,
         bos_token_id=0, eos_token_id=0, use_cache=False,
     )
+    hf_model = LlamaForCausalLM(hf_cfg)
+    if lora_rank:
+        probe = bases.Base(
+            key="smoke-lora", hf_name="HuggingFaceTB/SmolLM2-135M", params=0,
+            vocab_size=49_152, device="gpu", block_size=block_size,
+            micro_batch=1, grad_accum=1, world=1, lr=2e-4, warmup_steps=10,
+            note="", lora_rank=lora_rank, lora_alpha=2 * lora_rank,
+            lora_targets=bases.ALL_LINEAR)
+        hf_model = apply_lora(hf_model, probe)
     cfg = FinetuneConfig(base_key="smoke", hf_name="HuggingFaceTB/SmolLM2-135M",
-                         block_size=block_size, vocab_size=49_152, direction=direction)
-    return FinetuneModel(LlamaForCausalLM(hf_cfg), cfg).to(device)
+                         block_size=block_size, vocab_size=49_152,
+                         direction=direction, lora_rank=lora_rank)
+    return FinetuneModel(hf_model, cfg).to(device)
 
 
 def load_from_checkpoint(path, device: str | torch.device = "cpu"):
@@ -206,7 +283,9 @@ def load_from_checkpoint(path, device: str | torch.device = "cpu"):
     # weights-only files carry.
     cfg.direction = str(ckpt.get("direction", cfg.direction))
 
-    model = (build_smoke(cfg.block_size, cfg.direction)
+    # lora_rank has to be passed through: without it the smoke path rebuilds a
+    # plain model and every adapter key in the checkpoint comes back unexpected.
+    model = (build_smoke(cfg.block_size, cfg.direction, "cpu", cfg.lora_rank)
              if cfg.base_key == "smoke"
              else build(cfg.base_key, cfg.block_size, cfg.direction))
     model.cfg = cfg
@@ -217,6 +296,10 @@ def load_from_checkpoint(path, device: str | torch.device = "cpu"):
     drop = ("rotary_emb", "inv_freq") + (("lm_head.weight",) if tied else ())
     missing = [k for k in missing if not any(d in k for d in drop)]
     unexpected = [k for k in unexpected if not any(d in k for d in drop)]
+    if cfg.lora_rank:
+        # A LoRA checkpoint stores adapters only. Everything else came from the
+        # base download a few lines up and is supposed to be "missing".
+        missing = [k for k in missing if "lora_" in k]
     if missing or unexpected:
         raise RuntimeError(f"checkpoint mismatch. missing={missing} unexpected={unexpected}")
     return model.to(device).eval(), ckpt

@@ -510,7 +510,8 @@ def main() -> None:
         val_corpus = None
 
     if args.smoke_test:
-        model = basemodel.build_smoke(args.block_size, train_corpus.direction, device)
+        model = basemodel.build_smoke(args.block_size, train_corpus.direction,
+                                      device, bases.get(args.base).lora_rank)
     else:
         if train_corpus.base != bases.get(args.base).hf_name:
             raise SystemExit(

@@ -110,6 +110,9 @@ def training_summary(ckpt_path: Path, ckpt: dict) -> dict:
 
 def model_card(repo: str, cfg, hf_cfg, info: dict, args) -> str:
     name = repo.split("/")[-1]
+    method = (f"LoRA rank {cfg.lora_rank} on every linear projection, merged into "
+              "the base weights before upload"
+              if cfg.lora_rank else "full finetune, all parameters")
     loss = f"{info['loss']:.3f}" if isinstance(info.get("loss"), float) else "n/a"
     val = f"{info['val_loss']:.3f}" if isinstance(info.get("val_loss"), float) else "n/a"
     tokens = f"{info['tokens_seen'] / 1e9:.2f}B" if info.get("tokens_seen") else "n/a"
@@ -182,7 +185,7 @@ are prefix problems for a backward model.
 | | |
 | --- | --- |
 | base | [{cfg.hf_name}](https://huggingface.co/{cfg.hf_name}) |
-| method | full finetune, all parameters |
+| method | {method} |
 | architecture | unmodified `{hf_cfg.model_type}`, {getattr(hf_cfg, 'num_hidden_layers', '?')} layers, hidden {getattr(hf_cfg, 'hidden_size', '?')} |
 | context | {cfg.block_size} tokens |
 | direction | `{cfg.direction}` |
@@ -192,10 +195,10 @@ are prefix problems for a backward model.
 | best val loss | {val} |
 | hardware | Kaggle free tier |
 
-Full finetuning, not LoRA. Reversing token order is a far larger distribution
-shift than instruction tuning, closer to continued pretraining, and a low-rank
-adapter underfits it badly enough that you would conclude the idea does not work
-when the method was the problem.
+Reversing token order is a far larger distribution shift than instruction
+tuning, closer to continued pretraining, so whether a low-rank update can
+express it at all is an open question rather than settled practice. If this
+model was trained with LoRA, treat that as the experiment it is.
 
 Conversations were mixed into the finetuning corpus rather than added as a
 separate instruction-tuning stage, formatted in the base tokenizer's own ChatML.
@@ -254,6 +257,16 @@ def main() -> None:
     print(f"  {cfg.hf_name}, direction={cfg.direction}, step {ckpt.get('step')}")
     if cfg.base_key == "smoke":
         print("  warning: this is a smoke checkpoint, not a trained model")
+
+    if model.is_lora:
+        # Fold the adapters into the base weights. The published repo is then an
+        # ordinary Qwen3 that anyone can load, rather than an adapter that only
+        # works if the downloader also fetches the base and installs peft. It
+        # also means one code path downstream: GGUF conversion, Ollama and the
+        # model card do not have to know a LoRA run happened.
+        print(f"  merging LoRA rank {model.cfg.lora_rank} into the base weights")
+        model.hf = model.hf.merge_and_unload()
+        hf_cfg = model.hf.config
 
     hf_cfg.use_cache = True  # generation wants it back on
     model.hf.to(getattr(torch, args.dtype)).save_pretrained(out, safe_serialization=True)

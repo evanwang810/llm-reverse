@@ -165,7 +165,8 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
     # for no reason. Downloading the base on eight replicas at once would also
     # hit the Hub eight times, so only the driver process fetches it.
     if args.smoke_test:
-        model = basemodel.build_smoke(args.block_size, train_corpus.direction)
+        model = basemodel.build_smoke(args.block_size, train_corpus.direction,
+                                      "cpu", bases.get(args.base).lora_rank)
     else:
         if train_corpus.base != bases.get(args.base).hf_name:
             raise SystemExit(

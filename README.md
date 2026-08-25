@@ -136,6 +136,11 @@ finetune.
 
 ## Running it
 
+**New here? [RUNBOOK.md](RUNBOOK.md) is every step in order**, from creating the
+Kaggle notebook to talking to a GGUF locally, with the cells to paste. The rest
+of this file is the reasoning behind those steps.
+
+
 Pre-tokenize in a free Kaggle **CPU** notebook. Kaggle pulls from HuggingFace far
 faster than a home connection, spends no accelerator quota, and its output mounts
 into the training notebook through Add Input → Notebook Output, so nothing large
@@ -272,7 +277,9 @@ space and fuses two words, every single time.
 | `tpu_preflight.py` | proves the device works before a session is spent on it |
 | `chat.py` | terminal chat, reverse-aware, prefix and jeopardy modes |
 | `dashboard.py` | Gradio UI: live graphs, completions, chat, all reverse-aware |
-| `publish_hf.py` | checkpoint to HuggingFace repo, with a reload check |
+| `publish_hf.py` | checkpoint to HuggingFace repo, merges LoRA, reload check |
+| `export_gguf.py` | published folder to GGUF plus an Ollama Modelfile |
+| `serve_reverse.py` | talks to llama.cpp or Ollama with the token order flipped |
 | `kaggle_run.sh` | one command for a whole session, takes an hour budget |
 | `shakedown.py` | end-to-end rehearsal including a direction check |
 | `test_reverse.py` | the reversal properties |
