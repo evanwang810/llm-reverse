@@ -5,7 +5,7 @@ forwards and then has its token order reversed, so the model predicts each token
 from the ones that follow it. Give it the end of a passage and it writes what
 came before. Give it an answer and it writes the question.
 
-Two models, two devices, one codebase:
+Two runs, two devices, one codebase:
 
 | | small | large |
 | --- | --- | --- |
@@ -29,17 +29,45 @@ to gain from starting at noise. A pretrained model already knows English; what
 it does not know is which way round to emit it. Starting from a converged
 checkpoint means a session buys you adaptation rather than basic literacy.
 
-**Full finetuning, not LoRA.** Reversing token order is a far larger
-distribution shift than instruction tuning, closer to continued pretraining. A
-low-rank adapter underfits it badly, and the failure looks like "the idea does
-not work" rather than "the method was wrong", which is the worst kind of
-negative result to get. Every entry in `bases.py` is sized for a full finetune,
-at 16 bytes per parameter: half weights, half grads, fp32 master copy, and
-Adam's two moments.
+**Full finetune or LoRA, and both are here.** Reversing token order is a far
+larger distribution shift than instruction tuning, closer to continued
+pretraining, so the received wisdom is that a low-rank adapter will underfit it.
+That is a hypothesis, not a result: nobody has published a clean reverse-LoRA
+either way.
+
+A full finetune costs 16 bytes per parameter (half weights, half grads, fp32
+master copy, Adam's two moments); a frozen parameter costs 2. That single ratio
+is why LoRA reaches a 4B model on a 16 GB chip where a full finetune of it would
+need 64 GB, and it is the honest answer to "why not just reverse something big".
+
+The full-finetune entries are the control and the LoRA entries are the
+experiment. Run `small` first: without a full-finetune loss curve on the same
+data, a disappointing LoRA run tells you nothing about whether the method or the
+idea was at fault.
 
 ```bash
-python bases.py     # both entries with the memory arithmetic
+python bases.py     # all five entries with the memory arithmetic
 ```
+
+| base | params | trainable | state/device | tokens/session |
+| --- | --- | --- | --- | --- |
+| `small` | 135M | all | 2.2 GB | ~0.06B (30 min, 2×T4) |
+| `large` | 596M | all | 9.5 GB | ~1.4B (TPU) |
+| `large-gpu` | 596M | all | 9.5 GB | ~0.37B (2×T4) |
+| `large-lora-gpu` | 1.7B | 58M | 4.2 GB | ~0.18B (2×T4) |
+| `xlarge-lora` | 4.0B | 132M | 9.8 GB | ~0.28B (TPU) |
+
+The trade in one line: `xlarge-lora` is a 4B model that sees 0.28B tokens in a
+session; `large` is a 0.6B model that sees 1.4B. Bigger base, five times less
+adaptation, constrained update. Which wins is the experiment.
+
+One caveat worth knowing before you assume LoRA is the free lunch. RoPE makes
+attention depend on relative position `i - j`, and reversing a sequence flips the
+sign of every one of those offsets. The learned heads have asymmetric preferences
+over relative position, so flipping that is a large change to the QK bilinear
+form rather than a small perturbation of it. That is the specific reason low rank
+might not be enough here, and it is why these entries use rank 64 on all seven
+projections rather than the rank 8 that works for style transfer.
 
 ## Why these bases
 
