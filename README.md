@@ -309,6 +309,7 @@ space and fuses two words, every single time.
 | `publish_hf.py` | checkpoint to HuggingFace repo, merges LoRA, reload check |
 | `export_gguf.py` | published folder to GGUF plus an Ollama Modelfile |
 | `serve_reverse.py` | talks to llama.cpp or Ollama with the token order flipped |
+| `launch.py` | push and watch a Kaggle run from a terminal, no website |
 | `RUNBOOK.md` | every step from a blank Kaggle notebook to Ollama |
 | `kaggle_run.sh` | one command for a whole session, takes an hour budget |
 | `shakedown.py` | end-to-end rehearsal including a direction check |
