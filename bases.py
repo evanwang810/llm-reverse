@@ -151,6 +151,22 @@ BASES["large-gpu"] = Base(
 )
 
 
+# The cheapest possible proof that the TPU path works. Same 135M base as
+# `small`, but on the v5e-8, so a failed XLA setup costs you an hour instead of
+# a whole session. 2.2 GB of optimizer state against 16 GB of HBM leaves room
+# for a far bigger micro-batch than the T4 pair allows.
+#
+# Run this before `large` the first time you touch a TPU. If it trains, then the
+# device, the torch_xla build, the dataloader and the checkpoint path all work,
+# and the only thing left untested at the larger size is whether it fits.
+BASES["small-tpu"] = Base(
+    **{**BASES["small"].as_dict(), "key": "small-tpu", "device": "tpu",
+       "micro_batch": 8, "grad_accum": 2, "world": 8,
+       "note": "TPU shakedown: 135M on v5e-8, one cheap hour to prove the "
+               "device before betting a session on it"}
+)
+
+
 # LoRA on every linear in the block, not just attention. Reversal changes what
 # the MLP computes as much as what attention attends to, and the usual
 # attention-only target list leaves two thirds of each layer frozen.
@@ -253,15 +269,16 @@ def session_estimate(base: Base, hours: float, tok_per_s: float) -> str:
 
 
 if __name__ == "__main__":
-    for key in ("small", "large", "large-gpu", "large-lora-gpu", "xlarge-lora"):
+    for key in ("small", "small-tpu", "large", "large-gpu",
+                "large-lora-gpu", "xlarge-lora"):
         b = BASES[key]
         print(report(b))
         # Rough, measured-elsewhere throughputs. The TPU number is the one that
         # justifies the whole port: three to four times the tokens per session,
         # out of a quota that does not compete with the GPU one.
-        rate = {"small": (0.5, 35_000), "large": (8.5, 45_000),
-                "large-gpu": (11.3, 9_000), "large-lora-gpu": (11.3, 4_500),
-                "xlarge-lora": (8.5, 9_000)}[key]
+        rate = {"small": (0.5, 35_000), "small-tpu": (1.0, 110_000),
+                "large": (8.5, 45_000), "large-gpu": (11.3, 9_000),
+                "large-lora-gpu": (11.3, 4_500), "xlarge-lora": (8.5, 9_000)}[key]
         print(session_estimate(b, *rate))
         print()
     print(f"uint16 caps at 65,535 token ids. Anything above that doubles the "

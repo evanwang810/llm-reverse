@@ -14,7 +14,20 @@
 #
 # HOURS is your total budget including tokenizing. Everything else is derived
 # from it, so there is one number to think about.
+#
+# Environment switches:
+#   DEVICE=tpu      force the TPU path (default: autodetect)
+#   MONITOR=1       status blocks with a loss chart instead of raw step lines
+#   EXPORT=1        after training, write a downloadable HF folder to
+#                   /kaggle/working/model. This is what makes one session end
+#                   with a model rather than a checkpoint.
+#   GGUF=1          also write an f16 .gguf for Ollama (implies EXPORT=1)
+#   EXPORT_REPO=... push to this HuggingFace repo too, needs HF_TOKEN set
+#   CHAT_FRAC=0.2   share of the corpus that is conversations
+#   DIRECTION=...   reverse (default), forward, or both
 set -euo pipefail
+
+if [ "${GGUF:-0}" = "1" ]; then EXPORT=1; fi
 
 HOURS="${1:-9}"
 BASE="${2:-large}"
@@ -313,3 +326,45 @@ fi
 # the finetuning corpus instead, at CHAT_FRAC. Bolting a forward-format SFT
 # run onto a backward-trained model would stack two novel things on each
 # other, and when the result came out wrong you would not know which broke.
+
+# ---------------------------------------------------------------------------
+# One-session export. EXPORT=1 turns the newest checkpoint into a HuggingFace
+# folder under /kaggle/working, which is what the notebook Output tab serves,
+# so a single Save & Run All ends with a model you can download. GGUF=1 also
+# writes an f16 .gguf next to it for Ollama.
+#
+# It runs after training on purpose. If the session is killed early you still
+# have checkpoints; you just do the export in a free CPU notebook instead.
+# ---------------------------------------------------------------------------
+if [ "${EXPORT:-0}" = "1" ]; then
+  OUT_DIR="${EXPORT_DIR:-/kaggle/working/model}"
+  CKPT="$(ls -1t "$RUN"/weights_*.pt "$RUN"/milestone_*.pt "$RUN"/ckpt_*.pt 2>/dev/null | head -1)"
+  if [ -z "$CKPT" ]; then
+    echo "=== EXPORT=1 but no checkpoint in $RUN ===" >&2
+    exit 1
+  fi
+  echo "=== exporting $CKPT to $OUT_DIR ==="
+  EXPORT_ARGS="--ckpt $CKPT --out $OUT_DIR --repo ${EXPORT_REPO:-local/llm-reverse}"
+  # HF_TOKEN comes from Kaggle Secrets, never from a literal in the notebook.
+  if [ -n "${EXPORT_REPO:-}" ] && [ -n "${HF_TOKEN:-}" ]; then
+    EXPORT_ARGS="$EXPORT_ARGS --push"
+    echo "    and pushing to ${EXPORT_REPO}"
+  fi
+  python publish_hf.py $EXPORT_ARGS
+
+  if [ "${GGUF:-0}" = "1" ]; then
+    echo "=== converting to GGUF ==="
+    # Only the converter is needed for f16, not a compiled llama.cpp.
+    # Quantizing needs the binary, which is a multi-minute build; do that
+    # locally where you are not paying for accelerator time.
+    if [ ! -d /kaggle/working/llama.cpp ]; then
+      git clone -q --depth 1 https://github.com/ggml-org/llama.cpp /kaggle/working/llama.cpp
+    fi
+    pip install -q -r /kaggle/working/llama.cpp/requirements/requirements-convert_hf_to_gguf.txt
+    python export_gguf.py --hf-dir "$OUT_DIR" --llama-cpp /kaggle/working/llama.cpp --outtype f16 \
+      || echo "gguf conversion failed, the HF folder is still there"
+  fi
+
+  echo "=== done. Download from the notebook Output tab: $OUT_DIR ==="
+  ls -la "$OUT_DIR"
+fi

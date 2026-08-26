@@ -5,10 +5,13 @@
     python serve_reverse.py --backend ollama --model qwen3-0.6b-reverse
 
 Why this file exists. A reverse model predicts each token from the ones that
-follow it. Every local runner feeds it a prompt left to right and prints its
-output left to right, so talking to one directly gives fluent-looking nonsense
-and no error. Something has to reverse the token ids on the way in and on the
-way out, and neither llama.cpp nor Ollama has a hook for it.
+follow it, so both ends need flipping and no local runner has a hook for either.
+
+If you are happy reading output right to left, you only need half of this: run
+the GGUF directly with an empty prompt and read backwards. What you cannot do by
+hand is the input side, because a prompt has to arrive in reverse *token* order,
+and reversing the text is not the same operation. Word-reversing gets close;
+this gets it exact.
 
 ## The two backends are not equally correct
 

@@ -52,6 +52,7 @@ python bases.py     # all five entries with the memory arithmetic
 | base | params | trainable | state/device | tokens/session |
 | --- | --- | --- | --- | --- |
 | `small` | 135M | all | 2.2 GB | ~0.06B (30 min, 2×T4) |
+| `small-tpu` | 135M | all | 2.2 GB | ~0.4B (1 h, TPU shakedown) |
 | `large` | 596M | all | 9.5 GB | ~1.4B (TPU) |
 | `large-gpu` | 596M | all | 9.5 GB | ~0.37B (2×T4) |
 | `large-lora-gpu` | 1.7B | 58M | 4.2 GB | ~0.18B (2×T4) |
@@ -308,6 +309,7 @@ space and fuses two words, every single time.
 | `publish_hf.py` | checkpoint to HuggingFace repo, merges LoRA, reload check |
 | `export_gguf.py` | published folder to GGUF plus an Ollama Modelfile |
 | `serve_reverse.py` | talks to llama.cpp or Ollama with the token order flipped |
+| `RUNBOOK.md` | every step from a blank Kaggle notebook to Ollama |
 | `kaggle_run.sh` | one command for a whole session, takes an hour budget |
 | `shakedown.py` | end-to-end rehearsal including a direction check |
 | `test_reverse.py` | the reversal properties |
