@@ -330,8 +330,9 @@ else
   train_with_restarts || CODE_EXIT=$?
 fi
 
+echo "=== training stage done, exit ${CODE_EXIT} ==="
 if [ "$CODE_EXIT" -ne 0 ]; then
-  echo "=== training failed with $CODE_EXIT, not going on to fine-tuning ===" >&2
+  echo "=== training failed with $CODE_EXIT, stopping before export ===" >&2
   exit "$CODE_EXIT"
 fi
 
@@ -351,7 +352,18 @@ fi
 # ---------------------------------------------------------------------------
 if [ "${EXPORT:-0}" = "1" ]; then
   OUT_DIR="${EXPORT_DIR:-/kaggle/working/model}"
-  CKPT="$(ls -1t "$RUN"/weights_*.pt "$RUN"/milestone_*.pt "$RUN"/ckpt_*.pt 2>/dev/null | head -1)"
+  # Pure-shell newest-file scan. The obvious `ls -1t a* b* c* | head -1` cannot
+  # be used here: ls exits 2 when ANY operand does not match, pipefail turns
+  # that into the pipeline's status, and set -e then kills the script at the
+  # assignment with 2>/dev/null hiding the reason. That is exactly how a
+  # successful 24-minute run ended in ERROR with no message.
+  CKPT=""
+  for _pat in weights milestone ckpt; do
+    for _f in "$RUN"/${_pat}_*.pt; do
+      [ -e "$_f" ] || continue
+      if [ -z "$CKPT" ] || [ "$_f" -nt "$CKPT" ]; then CKPT="$_f"; fi
+    done
+  done
   if [ -z "$CKPT" ]; then
     echo "=== EXPORT=1 but no checkpoint in $RUN ===" >&2
     exit 1
