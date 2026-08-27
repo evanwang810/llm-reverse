@@ -269,11 +269,24 @@ train_with_restarts() {
       echo "=== restart $((attempt - 1)), resuming from the last checkpoint ==="
     fi
     code=0
+    local started
+    started="$(date +%s)"
     "${TRAIN_CMD[@]}" || code=$?
     if [ "$code" -eq 0 ]; then
       return 0
     fi
     now="$(date +%s)"
+    # A crash three hours in is worth retrying: preemption, a transient NCCL
+    # fault, a flaky mount. A crash in the first ninety seconds is not, because
+    # nothing changes between attempts and it fails identically. The TPU
+    # shakedown burned fifteen minutes reproducing one startup error eight times
+    # before giving up, and on the long run that is a wasted session.
+    if [ $((now - started)) -lt "${MIN_RETRY_SECONDS:-90}" ]; then
+      echo "=== training exited $code after $((now - started))s, before it got going." >&2
+      echo "    That is a startup failure, not a crash, so retrying would just" >&2
+      echo "    reproduce it. Fix what it printed above." >&2
+      return "$code"
+    fi
     if [ $((now - START_TS)) -ge "$DEADLINE_SECONDS" ]; then
       echo "=== training exited $code but the deadline has passed, stopping ==="
       return 0

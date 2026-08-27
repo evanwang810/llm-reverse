@@ -33,6 +33,18 @@ from dataclasses import dataclass, asdict
 # half weights (2) + half grads (2) + fp32 master copy (4) + Adam m and v (8).
 BYTES_PER_PARAM = 16
 
+# Activations dominate at these batch sizes and the first version of this file
+# ignored them, which cost a real T4 shakedown to OOM. Saved activations for the
+# backward pass run to roughly 20 tensors of (micro_batch x block x hidden) in
+# half precision, per layer:
+#
+#     activation_gb ~= layers * micro_batch * block * hidden * 2 * 20 / 1e9
+#
+# SmolLM2-135M at micro_batch 16 and block 1024 predicts 11.3 GB of activations
+# on top of 2.2 GB of state, against a card with 14.56 GiB. It died at 13.69 GB
+# allocated. The shapes below keep the total near two thirds of a device.
+ACT_TENSORS_PER_LAYER = 20
+
 # A frozen parameter costs only its half-precision weight. This is the entire
 # reason LoRA reaches models a full finetune cannot: at 4B, 16 bytes per
 # parameter is 64 GB and 2 bytes is 8 GB, and a v5e chip has 16.
@@ -61,6 +73,9 @@ class Base:
     lora_alpha: int = 0
     lora_targets: tuple[str, ...] = ()
     grad_checkpointing: bool = False
+    # Shape of the base, used only for the activation estimate below.
+    layers: int = 0
+    hidden: int = 0
     # Rough trainable count for the LoRA entries, so the memory table is
     # printable without downloading four billion parameters. basemodel reports
     # the real number once the model is built.
@@ -69,6 +84,14 @@ class Base:
     @property
     def is_lora(self) -> bool:
         return self.lora_rank > 0
+
+    @property
+    def activation_gb(self) -> float:
+        """Rough, and rough is enough to catch a shape that cannot fit."""
+        if not (self.layers and self.hidden):
+            return 0.0
+        return (self.layers * self.micro_batch * self.block_size * self.hidden
+                * 2 * ACT_TENSORS_PER_LAYER / 1e9)
 
     @property
     def state_gb(self) -> float:
@@ -108,9 +131,13 @@ BASES: dict[str, Base] = {
         vocab_size=49_152,
         device="gpu",
         block_size=1024,
-        micro_batch=16,
-        grad_accum=4,
+        # 4 x 16 x 2 x 1024 = 131,072 tokens/step, the same as every other
+        # entry. micro_batch 16 OOMed a real T4; this is ~2.8 GB of activations.
+        micro_batch=4,
+        grad_accum=16,
         world=2,
+        layers=30,
+        hidden=576,
         lr=3e-4,
         warmup_steps=100,
         note="smoke model: proves the pipeline and gives a real loss curve, "
@@ -132,9 +159,14 @@ BASES: dict[str, Base] = {
         vocab_size=151_669,
         device="tpu",
         block_size=1024,
-        micro_batch=4,
-        grad_accum=4,
+        # Qwen3-0.6B is 28 layers at hidden 1024, so each unit of micro_batch
+        # costs ~1.2 GB of activations on top of 9.5 GB of state. 2 fits a 16 GB
+        # v5e chip with room to spare; 4 would not.
+        micro_batch=2,
+        grad_accum=8,
         world=8,
+        layers=28,
+        hidden=1024,
         lr=1e-4,
         warmup_steps=200,
         note="the one you publish. bf16 on TPU, so no GradScaler and no "
@@ -145,7 +177,7 @@ BASES: dict[str, Base] = {
 # Same checkpoint, sized for the T4 pair instead. Slower, but it needs no XLA.
 BASES["large-gpu"] = Base(
     **{**BASES["large"].as_dict(), "key": "large-gpu", "device": "gpu",
-       "micro_batch": 2, "grad_accum": 16, "world": 2,
+       "micro_batch": 1, "grad_accum": 32, "world": 2,
        "note": "large on 2xT4: fits, but roughly a quarter the tokens per "
                "session, and fp16 on a bf16-native base"}
 )
@@ -161,7 +193,7 @@ BASES["large-gpu"] = Base(
 # and the only thing left untested at the larger size is whether it fits.
 BASES["small-tpu"] = Base(
     **{**BASES["small"].as_dict(), "key": "small-tpu", "device": "tpu",
-       "micro_batch": 8, "grad_accum": 2, "world": 8,
+       "micro_batch": 4, "grad_accum": 4, "world": 8,
        "note": "TPU shakedown: 135M on v5e-8, one cheap hour to prove the "
                "device before betting a session on it"}
 )
@@ -253,6 +285,9 @@ def report(base: Base) -> str:
         f"shards as {base.dtype} ({base.bytes_per_token} bytes/token)",
         how,
         mem,
+        (f"  activations ~{base.activation_gb:.1f} GB, total "
+         f"~{base.activation_gb + base.state_gb:.1f} GB per device"
+         if base.activation_gb else "  activations: unmeasured"),
         f"  batch: {base.micro_batch} micro x {base.grad_accum} accum x "
         f"{base.world} {'gpu' if base.device == 'gpu' else 'chip'} x "
         f"{base.block_size} = {base.tokens_per_step:,} tokens/step",

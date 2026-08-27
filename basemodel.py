@@ -69,6 +69,30 @@ class FinetuneModel(nn.Module):
             ignore_index=-1)
         return logits, loss
 
+    def _apply(self, *args, **kwargs):
+        """Re-tie the output head after anything that rebuilds the parameters.
+
+        nn.Module._apply can only update a parameter in place when the result is
+        shallow-copy compatible with the original. A move to a different device
+        type is not, so it builds a fresh Parameter for each entry in each
+        module's dict, and a Parameter shared by two modules comes back as two
+        independent tensors.
+
+        On CUDA this never surfaced. On XLA it does: .to(xla) silently untied
+        lm_head from the input embedding, giving 162,826,560 parameters where the
+        base has 134,515,008. The difference is 49,152 x 576, exactly one
+        embedding matrix. That is an extra copy of weights, gradients and Adam
+        moments per replica, and two output heads training apart.
+
+        The quiet part is the checkpoint, which would carry an lm_head that
+        resume then throws away. Re-tying here rather than at each call site
+        means a device move cannot undo it.
+        """
+        out = super()._apply(*args, **kwargs)
+        if getattr(self.hf.config, "tie_word_embeddings", False):
+            self.hf.tie_weights()
+        return out
+
     # ------------------------------------------------------------------ #
 
     @property
