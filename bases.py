@@ -40,9 +40,15 @@ BYTES_PER_PARAM = 16
 #
 #     activation_gb ~= layers * micro_batch * block * hidden * 2 * 20 / 1e9
 #
-# SmolLM2-135M at micro_batch 16 and block 1024 predicts 11.3 GB of activations
-# on top of 2.2 GB of state, against a card with 14.56 GiB. It died at 13.69 GB
-# allocated. The shapes below keep the total near two thirds of a device.
+# Treat that as a LOWER BOUND, because it has now been wrong twice on real
+# hardware. It misses two things: the MLP is wider than the residual stream
+# (SmolLM2-135M is hidden 576, intermediate 1536), and the logits are a tensor
+# of micro_batch x block x vocab that gets upcast to fp32 for the loss, which
+# for a 49k vocab is 800 MB before cross_entropy allocates anything of its own.
+#
+# So the entries that live on a 14.56 GiB card set grad_checkpointing instead of
+# trusting the arithmetic. Recomputing activations in the backward pass costs
+# about 30% throughput and makes the whole class of failure go away.
 ACT_TENSORS_PER_LAYER = 20
 
 # A frozen parameter costs only its half-precision weight. This is the entire
@@ -87,7 +93,7 @@ class Base:
 
     @property
     def activation_gb(self) -> float:
-        """Rough, and rough is enough to catch a shape that cannot fit."""
+        """A lower bound on activation memory. See the note at the top."""
         if not (self.layers and self.hidden):
             return 0.0
         return (self.layers * self.micro_batch * self.block_size * self.hidden
@@ -138,6 +144,9 @@ BASES: dict[str, Base] = {
         world=2,
         layers=30,
         hidden=576,
+        # Two OOMs on a real T4 at micro_batch 16 and then 4. Recompute instead
+        # of storing; the shakedown is not throughput-sensitive anyway.
+        grad_checkpointing=True,
         lr=3e-4,
         warmup_steps=100,
         note="smoke model: proves the pipeline and gives a real loss curve, "
@@ -178,6 +187,7 @@ BASES: dict[str, Base] = {
 BASES["large-gpu"] = Base(
     **{**BASES["large"].as_dict(), "key": "large-gpu", "device": "gpu",
        "micro_batch": 1, "grad_accum": 32, "world": 2,
+       "grad_checkpointing": True,
        "note": "large on 2xT4: fits, but roughly a quarter the tokens per "
                "session, and fp16 on a bf16-native base"}
 )
@@ -194,6 +204,10 @@ BASES["large-gpu"] = Base(
 BASES["small-tpu"] = Base(
     **{**BASES["small"].as_dict(), "key": "small-tpu", "device": "tpu",
        "micro_batch": 4, "grad_accum": 4, "world": 8,
+       # Off, unlike `small`. A v5e chip has no DDP gradient buckets and bf16
+       # activations are half the size of fp32 ones, so the TPU path fits
+       # without recomputing. Verified on a live v5e-8 before this was written.
+       "grad_checkpointing": False,
        "note": "TPU shakedown: 135M on v5e-8, one cheap hour to prove the "
                "device before betting a session on it"}
 )
@@ -285,9 +299,10 @@ def report(base: Base) -> str:
         f"shards as {base.dtype} ({base.bytes_per_token} bytes/token)",
         how,
         mem,
-        (f"  activations ~{base.activation_gb:.1f} GB, total "
-         f"~{base.activation_gb + base.state_gb:.1f} GB per device"
-         if base.activation_gb else "  activations: unmeasured"),
+        (f"  activations >~{base.activation_gb:.1f} GB (lower bound), "
+         f"grad checkpointing {'on' if base.grad_checkpointing else 'off'}"
+         if base.activation_gb else
+         f"  grad checkpointing {'on' if base.grad_checkpointing else 'off'}"),
         f"  batch: {base.micro_batch} micro x {base.grad_accum} accum x "
         f"{base.world} {'gpu' if base.device == 'gpu' else 'chip'} x "
         f"{base.block_size} = {base.tokens_per_step:,} tokens/step",
