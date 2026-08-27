@@ -52,19 +52,43 @@ class RunDir:
 
     def init_csv(self) -> None:
         if not self.csv_path.exists():
-            with open(self.csv_path, "w", newline="") as f:
-                csv.DictWriter(f, CSV_FIELDS).writeheader()
+            with open(self.csv_path, "a", newline="") as f:
+                if f.tell() == 0:
+                    csv.DictWriter(f, CSV_FIELDS).writeheader()
 
     def append_csv(self, row: dict) -> None:
-        with open(self.csv_path, "a", newline="") as f:
-            w = csv.DictWriter(f, CSV_FIELDS, extrasaction="ignore")
-            w.writerow({k: row.get(k, "") for k in CSV_FIELDS})
-            f.flush()
+        """Append one row. Never raises.
+
+        A loss row is a log line: losing one costs a gap in a chart. Letting the
+        write take the run down costs every step since the last checkpoint, and
+        on a committed Kaggle session you learn about it after the fact. So the
+        file is recreated if it went missing, and a second failure is swallowed.
+        """
+        for attempt in (1, 2):
+            try:
+                if not self.csv_path.exists():
+                    self.path.mkdir(parents=True, exist_ok=True)
+                    self.init_csv()
+                with open(self.csv_path, "a", newline="") as f:
+                    w = csv.DictWriter(f, CSV_FIELDS, extrasaction="ignore")
+                    w.writerow({k: row.get(k, "") for k in CSV_FIELDS})
+                    f.flush()
+                return
+            except OSError as exc:
+                if attempt == 2:
+                    print(f"  [runstate] dropped a loss row: "
+                          f"{type(exc).__name__}: {exc}", flush=True)
 
     def write_status(self, status: dict) -> None:
+        """Same contract as append_csv: the dashboard is not worth a run."""
         status = dict(status)
         status["heartbeat"] = time.time()
-        atomic_write(self.status_path, json.dumps(status, indent=1))
+        try:
+            self.path.mkdir(parents=True, exist_ok=True)
+            atomic_write(self.status_path, json.dumps(status, indent=1))
+        except OSError as exc:
+            print(f"  [runstate] status write failed: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
 
     def poll_flags(self) -> set[str]:
         """Return the flags that are set and clear them."""
