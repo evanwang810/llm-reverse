@@ -73,7 +73,13 @@ def write_backwards(model, tok, text, max_new_tokens=64, temperature=0.8,
 # --------------------------------------------------------------------------- #
 
 
-def verify(model, out: Path, block_size: int) -> float:
+# Relative tolerance per storage dtype, from the mantissa each one keeps.
+# bf16 has 8 bits, so ~1/256; fp16 has 11, so ~1/2048; fp32 is exact enough that
+# anything above rounding noise means a real mismatch.
+TOLERANCE = {"float32": 1e-5, "float16": 2e-3, "bfloat16": 1.5e-2}
+
+
+def verify(model, out: Path, block_size: int, dtype_name: str = "float32") -> float:
     """Reload what was written and check it agrees with what was in memory.
 
     Cheap, and it is the only thing between you and a repo full of
@@ -88,9 +94,17 @@ def verify(model, out: Path, block_size: int) -> float:
         a = model.hf(input_ids=ids).logits
         b = reloaded(input_ids=ids).logits
     delta = float((a.float() - b.float()).abs().max())
-    if delta > 1e-3:
-        raise RuntimeError(f"reloaded model disagrees with the checkpoint by {delta:.2e}")
-    return delta
+    # Relative to the logit scale. An absolute threshold means something
+    # different for every vocabulary size and every model temperature.
+    scale = max(float(a.float().abs().max()), 1.0)
+    rel = delta / scale
+    tol = TOLERANCE.get(dtype_name, 1e-5)
+    if rel > tol:
+        raise RuntimeError(
+            f"reloaded model disagrees with the checkpoint by {delta:.2e} "
+            f"absolute, {rel:.2e} relative, which is above the {tol:.1e} "
+            f"tolerance for {dtype_name}. That is a real mismatch, not rounding.")
+    return rel
 
 
 def training_summary(ckpt_path: Path, ckpt: dict) -> dict:
@@ -278,8 +292,9 @@ def main() -> None:
 
     if not args.no_verify:
         model.hf.to(torch.float32)
-        delta = verify(model, out, cfg.block_size)
-        print(f"  reloaded weights match to {delta:.2e}")
+        rel = verify(model, out, cfg.block_size, args.dtype)
+        print(f"  reloaded weights match to {rel:.2e} relative "
+              f"(tolerance {TOLERANCE.get(args.dtype, 1e-5):.1e} for {args.dtype})")
 
     info = training_summary(ckpt_path, ckpt)
     (out / "README.md").write_text(model_card(args.repo, cfg, hf_cfg, info, args),
