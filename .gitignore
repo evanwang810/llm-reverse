@@ -21,3 +21,8 @@ dataset-metadata.json
 
 # hf export folders
 hf_export/
+
+localrun/
+.launch/
+downloaded/
+hf_export/
