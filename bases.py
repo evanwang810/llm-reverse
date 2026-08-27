@@ -51,6 +51,17 @@ BYTES_PER_PARAM = 16
 # about 30% throughput and makes the whole class of failure go away.
 ACT_TENSORS_PER_LAYER = 20
 
+# MEASURED, on a real 2xT4 Kaggle session: SmolLM2-135M at micro_batch 4,
+# grad_accum 16, gradient checkpointing on, did 43 steps of 131,072 tokens in
+# 24 minutes. That is 3,914 tok/s, against the 35,000 this file used to claim.
+#
+# About 3% of a T4 pair's peak, and most of the loss was self-inflicted: with
+# checkpointing on, a micro_batch of 4 at seq 1024 leaves the card idle. The
+# shapes below trade the memory checkpointing frees back for a larger
+# micro_batch. Anything below not marked MEASURED is an extrapolation and should
+# be read as one; three estimates in this file have already been wrong.
+MEASURED_T4_SMALL_TOK_S = 3_914
+
 # A frozen parameter costs only its half-precision weight. This is the entire
 # reason LoRA reaches models a full finetune cannot: at 4B, 16 bytes per
 # parameter is 64 GB and 2 bytes is 8 GB, and a v5e chip has 16.
@@ -137,10 +148,12 @@ BASES: dict[str, Base] = {
         vocab_size=49_152,
         device="gpu",
         block_size=1024,
-        # 4 x 16 x 2 x 1024 = 131,072 tokens/step, the same as every other
-        # entry. micro_batch 16 OOMed a real T4; this is ~2.8 GB of activations.
-        micro_batch=4,
-        grad_accum=16,
+        # 8 x 8 x 2 x 1024 = 131,072 tokens/step, the same as every other
+        # entry. micro_batch 16 OOMed a real T4 with checkpointing off; with it
+        # on, hidden activations stop being the constraint and the logits become
+        # it (8 x 1024 x 49,152 upcast to fp32 is 1.6 GB). 8 is the compromise.
+        micro_batch=8,
+        grad_accum=8,
         world=2,
         layers=30,
         hidden=576,
@@ -203,7 +216,7 @@ BASES["large-gpu"] = Base(
 # and the only thing left untested at the larger size is whether it fits.
 BASES["small-tpu"] = Base(
     **{**BASES["small"].as_dict(), "key": "small-tpu", "device": "tpu",
-       "micro_batch": 4, "grad_accum": 4, "world": 8,
+       "micro_batch": 8, "grad_accum": 2, "world": 8,
        # Off, unlike `small`. A v5e chip has no DDP gradient buckets and bf16
        # activations are half the size of fp32 ones, so the TPU path fits
        # without recomputing. Verified on a live v5e-8 before this was written.
@@ -312,10 +325,12 @@ def report(base: Base) -> str:
     return "\n".join(lines)
 
 
-def session_estimate(base: Base, hours: float, tok_per_s: float) -> str:
+def session_estimate(base: Base, hours: float, tok_per_s: float,
+                     provenance: str = "") -> str:
     tokens = hours * 3600 * tok_per_s
-    return (f"  ~{tok_per_s / 1000:.0f}k tok/s -> {tokens / 1e9:.2f}B tokens in "
+    line = (f"  ~{tok_per_s / 1000:.1f}k tok/s -> {tokens / 1e9:.2f}B tokens in "
             f"{hours:.1f}h, {tokens / base.tokens_per_step:,.0f} steps")
+    return line + (f"\n    {provenance}" if provenance else "")
 
 
 if __name__ == "__main__":
@@ -326,9 +341,15 @@ if __name__ == "__main__":
         # Rough, measured-elsewhere throughputs. The TPU number is the one that
         # justifies the whole port: three to four times the tokens per session,
         # out of a quota that does not compete with the GPU one.
-        rate = {"small": (0.5, 35_000), "small-tpu": (1.0, 110_000),
-                "large": (8.5, 45_000), "large-gpu": (11.3, 9_000),
-                "large-lora-gpu": (11.3, 4_500), "xlarge-lora": (8.5, 9_000)}[key]
+        # (hours, tok/s, where the tok/s came from)
+        rate = {
+            "small":          (0.5,  8_000,  "MEASURED 3,914 at micro_batch 4; x2 for micro_batch 8"),
+            "small-tpu":      (1.0,  40_000, "extrapolated, UNVERIFIED on TPU"),
+            "large":          (8.5,  12_000, "extrapolated, UNVERIFIED on TPU"),
+            "large-gpu":      (11.3, 1_200,  "extrapolated from the T4 measurement, scaled by params"),
+            "large-lora-gpu": (11.3, 700,    "extrapolated, UNVERIFIED"),
+            "xlarge-lora":    (8.5,  2_500,  "extrapolated, UNVERIFIED"),
+        }[key]
         print(session_estimate(b, *rate))
         print()
     print(f"uint16 caps at 65,535 token ids. Anything above that doubles the "
