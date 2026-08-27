@@ -1,7 +1,9 @@
 #!/usr/bin/env python
 """Push and watch a Kaggle run from here, without opening the website.
 
-    python launch.py shakedown          # small-tpu, ~1.2h, proves the device
+    python launch.py explain            # what each run proves, pushes nothing
+    python launch.py shakedown          # TPU,  ~0.5h, proves the path
+    python launch.py shakedown-gpu      # 2xT4, ~0.5h, proves the path
     python launch.py train              # large, ~8.5h, ends with a .gguf
     python launch.py status             # is it still going
     python launch.py fetch              # download the finished output
@@ -36,29 +38,61 @@ REPO = "https://github.com/evanwang810/llm-reverse"
 TPU_IDS = ("TpuV5E8", "TpuV6E8", "Tpu1VmV38")
 GPU_IDS = ("NvidiaTeslaT4", "NvidiaTeslaP100")
 
+# A shakedown is not a small training run. It is a list of things that can be
+# broken, executed in order, and 2e7 tokens is enough to reach every one of them.
+# Going bigger only buys you a better loss curve on a model you are going to
+# throw away.
+PROVES = [
+    "the accelerator is real and the account is verified (a greyed-out "
+    "dropdown silently falls back to CPU, which trains fine and slowly)",
+    "the corpus streams from HuggingFace and the shard writer works",
+    "the reversal is actually applied, visible as a loss spike then recovery",
+    "the base model downloads and moves onto the device",
+    "training steps run without recompiling every step (the classic XLA hang)",
+    "a checkpoint gets written and pruned",
+    "the export stage turns a checkpoint into a downloadable folder",
+]
+
 RUNS = {
     "shakedown": {
-        "base": "small-tpu", "hours": "1.2", "tokens": "1e8", "device": "tpu",
+        "base": "small-tpu", "hours": "0.5", "tokens": "2e7", "device": "tpu",
         "env": {"EXPORT": "1"},
-        "why": "one cheap hour to prove the TPU, the torch_xla build, the "
-               "dataloader and the checkpoint path all work",
+        "why": "half an hour to prove the TPU path end to end",
+        "extra": "torch_xla imports, bf16 autocast works, and eight replicas "
+                 "agree. tpu_preflight.py gates this in about two minutes, "
+                 "which matters because TPU failures usually present as a hang "
+                 "rather than an error.",
+    },
+    "shakedown-gpu": {
+        "base": "small", "hours": "0.5", "tokens": "2e7", "device": "gpu",
+        "env": {"EXPORT": "1"},
+        "why": "half an hour to prove the dual-T4 path end to end",
+        "extra": "DDP engages across both cards, and the fp16 GradScaler "
+                 "settles instead of collapsing. Turing has no bf16, so this "
+                 "is the run that tells you whether the loss scale is stable "
+                 "on your base before you spend a long session on it.",
     },
     "train": {
         "base": "large", "hours": "8.5", "tokens": "1e9", "device": "tpu",
         "env": {"GGUF": "1",
                 "TRAIN_EXTRA": "--keep-checkpoints 1 --keep-weights 2 "
                                "--milestone-every-min 0"},
-        "why": "the real run. Those TRAIN_EXTRA flags are the disk budget, not "
-               "a preference: /kaggle/working caps at 20 GB and one full "
-               "checkpoint of Qwen3-0.6B is 7.2 GB on its own",
+        "why": "the real run, ending in a .gguf you can download",
+        "extra": "Those TRAIN_EXTRA flags are the disk budget, not a "
+                 "preference: /kaggle/working caps at 20 GB and one full "
+                 "checkpoint of Qwen3-0.6B is 7.2 GB on its own. Run a "
+                 "shakedown first; this one is eight and a half hours and TPU "
+                 "failures do not announce themselves.",
     },
     "train-gpu": {
         "base": "large-gpu", "hours": "11.3", "tokens": "1e9", "device": "gpu",
         "env": {"GGUF": "1",
                 "TRAIN_EXTRA": "--keep-checkpoints 1 --keep-weights 2 "
                                "--milestone-every-min 0"},
-        "why": "same base on the T4 pair, roughly a quarter the tokens, if the "
-               "TPU is unavailable",
+        "why": "the real run on the T4 pair instead",
+        "extra": "Roughly a quarter the tokens per session, and fp16 on a "
+                 "bf16-native base. Use it if the TPU is unavailable or the "
+                 "shakedown failed on it.",
     },
 }
 
@@ -192,6 +226,13 @@ def cmd_run(args: argparse.Namespace) -> None:
     print(f"  budget     {spec['hours']}h, {spec['tokens']} tokens")
     print(f"  kernel     {user}/{slug}")
     print(f"  why        {spec['why']}")
+    if args.what.startswith("shakedown"):
+        print("\n  it proves, in order:")
+        for i, line in enumerate(PROVES, 1):
+            print(f"    {i}. {line}")
+        print(f"\n  and specifically: {spec['extra']}")
+    else:
+        print(f"\n  {spec['extra']}")
     print(f"\nThis consumes roughly {spec['hours']} hours of your weekly "
           f"{spec['device'].upper()} quota.")
 
@@ -209,6 +250,20 @@ def cmd_run(args: argparse.Namespace) -> None:
     print(f"  python launch.py status --slug {slug}")
     print(f"  python launch.py fetch  --slug {slug}")
     print("\nIt runs on Kaggle's servers. Your machine can sleep.")
+
+
+def cmd_explain(args: argparse.Namespace) -> None:
+    print("A shakedown proves, in order:\n")
+    for i, line in enumerate(PROVES, 1):
+        print(f"  {i}. {line}")
+    print("\n2e7 tokens reaches every one of them. Bigger only buys a better "
+          "loss curve\non a model you are going to throw away.\n")
+    for name, spec in RUNS.items():
+        print(f"--- {name}")
+        print(f"    base {spec['base']}, {spec['device']}, {spec['hours']}h, "
+              f"{spec['tokens']} tokens")
+        print(f"    {spec['why']}")
+        print(f"    {spec['extra']}\n")
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -249,6 +304,9 @@ def main() -> None:
         s.add_argument("--public", action="store_true")
         s.add_argument("--yes", action="store_true", help="skip the confirmation")
         s.set_defaults(func=cmd_run, what=name)
+
+    s = sub.add_parser("explain", help="what each run does, without pushing")
+    s.set_defaults(func=cmd_explain)
 
     s = sub.add_parser("status")
     s.add_argument("--slug", default="")
