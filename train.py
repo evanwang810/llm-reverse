@@ -73,7 +73,9 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--block-size", type=int, default=0,
                    help="0 takes the base entry's value")
     g.add_argument("--attn", default="sdpa",
-                   help="attention implementation. sdpa everywhere; "
+                   help="attention implementation. sdpa on GPU; the TPU path "
+                        "forces eager, because bf16 autocast splits q/k from v "
+                        "and SDPA refuses a mixed-dtype call. "
                         "flash_attention_2 needs sm80+, which the T4 is not")
 
     g = p.add_argument_group("optim")

@@ -175,7 +175,7 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
                 "tokenizer are meaningless to another model and nothing downstream "
                 "would raise, so this is refused here.")
         model = basemodel.build(args.base, args.block_size, train_corpus.direction,
-                                "cpu", args.attn)
+                                "cpu", basemodel.attn_for("tpu"))
     cfg = model.cfg
     fingerprint = train_corpus.fingerprint()
     step, tokens_seen = 0, 0

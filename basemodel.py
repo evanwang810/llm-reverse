@@ -176,6 +176,18 @@ def apply_lora(hf_model, base):
     return model
 
 
+def attn_for(device: str) -> str:
+    """Which attention implementation is safe on a given device.
+
+    "eager" on XLA is not a performance compromise, it is a correctness one.
+    Under bf16 autocast the rotary embedding promotes q and k back to fp32 while
+    v stays bf16, and SDPA refuses a mixed-dtype call. Eager attention unifies
+    them itself because its matmuls are autocast ops. XLA fuses the result
+    either way, so the usual reason to prefer SDPA does not apply here.
+    """
+    return "eager" if device == "tpu" else "sdpa"
+
+
 def build(base_key: str, block_size: int, direction: str = "reverse",
           device: torch.device | str = "cpu", attn: str = "sdpa") -> FinetuneModel:
     """Download the base checkpoint and wrap it.

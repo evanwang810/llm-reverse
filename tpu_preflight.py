@@ -156,7 +156,8 @@ def _mp_fn(index, opts: dict):
     # model you are about to spend a session on, so it builds the real base
     # rather than a stand-in. Downloading it here also warms the cache before
     # eight replicas ask for it at once.
-    model = basemodel.build(opts["base"], opts["block_size"]).to(dev)
+    model = basemodel.build(opts["base"], opts["block_size"],
+                            attn=basemodel.attn_for("tpu")).to(dev)
     cfg = model.cfg
     opt = model.configure_optimizer(1e-3, 0.1, (0.9, 0.95), "xla")
 
