@@ -132,28 +132,52 @@ def creds_path() -> Path:
     return Path.home() / ".kaggle" / "kaggle.json"
 
 
-def preflight() -> str:
-    """Return the username, or exit explaining exactly what is missing."""
+def preflight(user_override: str = "") -> str:
+    """Return the Kaggle username, or exit explaining exactly what is missing.
+
+    Three auth styles are all valid and the CLI accepts any of them, so try in
+    the order that asks least of you:
+      * kaggle.json, the classic file, which carries the username
+      * $KAGGLE_API_TOKEN or ~/.kaggle/access_token, the newer bare token,
+        which does not, so the username is read back from the API
+      * `kaggle auth login`, OAuth, which caches its own credentials
+    """
     if not have("kaggle"):
         raise SystemExit(
             "the kaggle CLI is not installed.\n"
             "  pip install kaggle\n"
             "then rerun this.")
+    if user_override:
+        return user_override
+
     path = creds_path()
-    if not path.exists():
+    if path.exists():
+        try:
+            return json.loads(path.read_text())["username"]
+        except Exception as exc:
+            raise SystemExit(f"{path} is not valid Kaggle credentials: {exc}")
+
+    # A bare token authenticates fine but does not say who you are, and the
+    # kernel id has to be "username/slug". Read it back off your own kernels.
+    if os.environ.get("KAGGLE_API_TOKEN") or (path.parent / "access_token").exists():
+        proc = subprocess.run(["kaggle", "kernels", "list", "-m", "--csv"],
+                              capture_output=True, text=True)
+        for line in proc.stdout.splitlines()[1:]:
+            ref = line.split(",")[0].strip()
+            if "/" in ref:
+                return ref.split("/")[0]
         raise SystemExit(
-            f"no API token at {path}.\n"
-            "  1. kaggle.com -> your avatar -> Settings\n"
-            "  2. API section -> Create New Token, which downloads kaggle.json\n"
-            f"  3. move it to {path}\n"
-            "\nWhile you are in Settings, check Phone Verification is done. "
-            "Without it the accelerator dropdown is greyed out and every run "
-            "here silently falls back to CPU.")
-    try:
-        user = json.loads(path.read_text())["username"]
-    except Exception as exc:
-        raise SystemExit(f"{path} is not valid Kaggle credentials: {exc}")
-    return user
+            "the token authenticates but you have no kernels yet, so the "
+            "username cannot be read back from it. Pass --user YOURNAME once.")
+
+    raise SystemExit(
+        "no Kaggle credentials found. Any one of these works:\n"
+        "  kaggle auth login              OAuth, nothing to store\n"
+        "  export KAGGLE_API_TOKEN=...    token from Settings -> API\n"
+        f"  {path}                        Create New Token downloads it\n"
+        "\nWhile you are in Settings, check Phone Verification is done. Without "
+        "it the accelerator dropdown is greyed out and runs silently fall back "
+        "to CPU, which trains fine and uselessly slowly.")
 
 
 def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
@@ -216,7 +240,7 @@ def push(work: Path, accelerators: tuple[str, ...]) -> None:
 
 def cmd_run(args: argparse.Namespace) -> None:
     spec = RUNS[args.what]
-    user = preflight()
+    user = preflight(getattr(args, 'user', ''))
     slug = args.slug or f"llm-reverse-{args.what}"
     work = Path(args.work_dir) / slug
 
@@ -267,14 +291,14 @@ def cmd_explain(args: argparse.Namespace) -> None:
 
 
 def cmd_status(args: argparse.Namespace) -> None:
-    user = preflight()
+    user = preflight(getattr(args, 'user', ''))
     slug = args.slug or "llm-reverse-train"
     run(["kaggle", "kernels", "status", f"{user}/{slug}"], check=False)
     print(f"\nfull log: https://www.kaggle.com/code/{user}/{slug}")
 
 
 def cmd_fetch(args: argparse.Namespace) -> None:
-    user = preflight()
+    user = preflight(getattr(args, 'user', ''))
     slug = args.slug or "llm-reverse-train"
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -300,6 +324,7 @@ def main() -> None:
     for name in RUNS:
         s = sub.add_parser(name, help=RUNS[name]["why"][:60])
         s.add_argument("--slug", default="")
+        s.add_argument("--user", default="")
         s.add_argument("--work-dir", default=".launch")
         s.add_argument("--public", action="store_true")
         s.add_argument("--yes", action="store_true", help="skip the confirmation")
@@ -310,10 +335,12 @@ def main() -> None:
 
     s = sub.add_parser("status")
     s.add_argument("--slug", default="")
+    s.add_argument("--user", default="")
     s.set_defaults(func=cmd_status)
 
     s = sub.add_parser("fetch")
     s.add_argument("--slug", default="")
+    s.add_argument("--user", default="")
     s.add_argument("--out", default="downloaded")
     s.set_defaults(func=cmd_fetch)
 
